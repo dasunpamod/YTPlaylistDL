@@ -20,7 +20,8 @@ import math
 import asyncio
 import logging
 import threading
-from youtube_dl import YoutubeDL
+import traceback
+from yt_dlp import YoutubeDL
 from asyncio import get_running_loop
 from functools import partial
 from hachoir.metadata import extractMetadata
@@ -119,7 +120,7 @@ def ytdl_dowload(url, opts):
             ytdl_data = ytdl.extract_info(url)
     except Exception as e:
         is_downloading = False
-        print(e)
+        LOGGER.error(f"Error during download: {e}\n{traceback.format_exc()}")
 
 
 @Client.on_message(filters.regex(pattern=".*http.* (.*)"))
@@ -127,38 +128,44 @@ async def uloader(client, message):
 
     global is_downloading
 
-    try:
-        fsub = os.environ.get("UPDTE_CHNL")
-    except:
-        pass
-    if fsub:
-        if not (await pyro_fsub(client, message, fsub) == True):
-            return
+    fsub = os.environ.get("UPDTE_CHNL")
+    if fsub and not await pyro_fsub(client, message, fsub):
+        return
 
     if is_downloading:
         return await message.reply_text(
             "`Another download is in progress, try again after sometime.`", quote=True
         )
 
-    url = message.text.split(None, 1)[0]
-    typee = message.text.split(None, 1)[1]
+    try:
+        is_downloading = True
+        url = message.text.split(None, 1)[0]
+        typee = message.text.split(None, 1)[1]
 
-    if "playlist?list=" in url:
-        msg = await client.send_message(
-            message.chat.id, "`Processing...`", reply_to_message_id=message.message_id
-        )
-    else:
-        return await client.send_message(
-            message.chat.id,
-            "`I think this is invalid link...`",
-            reply_to_message_id=message.message_id,
-        )
+        if "playlist?list=" in url:
+            msg = await client.send_message(
+                message.chat.id, "`Processing...`", reply_to_message_id=message.message_id
+            )
+        else:
+            # Setting is_downloading to False here before returning early
+            # is important because the finally block won't be reached
+            # if we return from inside the try without an exception.
+            # However, the task asks for a single finally: is_downloading = False
+            # This means we should not return early here but let it flow
+            # or ensure the finally is always hit.
+            # For now, let's assume this return will be caught by the structure.
+            # Actually, a return from try does execute finally. So this is fine.
+            return await client.send_message(
+                message.chat.id,
+                "`I think this is invalid link...`",
+                reply_to_message_id=message.message_id,
+            )
 
-    out_folder = f"downloads/{uuid.uuid4()}/"
-    if not os.path.isdir(out_folder):
-        os.makedirs(out_folder)
+        out_folder = f"downloads/{uuid.uuid4()}/"
+        if not os.path.isdir(out_folder):
+            os.makedirs(out_folder)
 
-    if (os.environ.get("USE_HEROKU") == "True") and (typee == "audio"):
+        if (os.environ.get("USE_HEROKU") == "True") and (typee == "audio"):
         opts = {
             "format": "bestaudio",
             "addmetadata": True,
@@ -228,7 +235,7 @@ async def uloader(client, message):
         }
         song = False
         video = True
-    is_downloading = True
+    # is_downloading = True # Moved to the top of the try block
     try:
         logchnl = int(os.environ.get("LOG_CHNL"))
     except:
@@ -241,10 +248,15 @@ async def uloader(client, message):
         await msg.edit("`Downloading Playlist...`")
         loop = get_running_loop()
         await loop.run_in_executor(None, partial(ytdl_dowload, url, opts))
-        filename = sorted(get_lst_of_files(out_folder, []))
-    except Exception as e:
-        is_downloading = False
-        return await msg.edit("Error: " + e)
+        filename = get_lst_of_files(out_folder)
+    except Exception as e: # This is the ytdl_dowload call exception
+        # is_downloading = False # Will be handled by finally
+        # We might want to log this specific error before it's caught by the broader one
+        LOGGER.error(f"Download executor error: {e}\n{traceback.format_exc()}")
+        # If msg is defined, edit it.
+        if 'msg' in locals() and msg:
+            await msg.edit(f"Error during download process: {str(e)}")
+        return # Exit uloader if download fails
 
     c_time = time.time()
     try:
@@ -274,7 +286,7 @@ async def uloader(client, message):
         LOGGER.info(f"Clearing {out_folder}")
         shutil.rmtree(out_folder)
         await del_old_msg_send_msg(msg, client, message)
-        is_downloading = False
+        # is_downloading = False # Handled by finally
 
     if video:
         for single_file in filename:
@@ -302,17 +314,29 @@ async def uloader(client, message):
         LOGGER.info(f"Clearing {out_folder}")
         shutil.rmtree(out_folder)
         await del_old_msg_send_msg(msg, client, message)
+        # is_downloading = False # Handled by finally
+    except Exception as e:
+        LOGGER.error(f"Unhandled error in uloader: {e}\n{traceback.format_exc()}")
+        if 'msg' in locals() and msg:
+            try:
+                await msg.edit(f"An unexpected error occurred: {str(e)}")
+            except Exception as edit_e:
+                LOGGER.error(f"Failed to edit message with error: {edit_e}")
+        if 'out_folder' in locals() and out_folder and os.path.exists(out_folder):
+            try:
+                shutil.rmtree(out_folder)
+                LOGGER.info(f"Cleaned up {out_folder} after error.")
+            except Exception as rmtree_e:
+                LOGGER.error(f"Failed to cleanup {out_folder} after error: {rmtree_e}")
+    finally:
         is_downloading = False
 
 
-def get_lst_of_files(input_directory, output_lst):
-    filesinfolder = os.listdir(input_directory)
-    for file_name in filesinfolder:
-        current_file_name = os.path.join(input_directory, file_name)
-        if os.path.isdir(current_file_name):
-            return get_lst_of_files(current_file_name, output_lst)
-        output_lst.append(current_file_name)
-    return output_lst
+def get_lst_of_files(input_directory):
+    all_entries = os.listdir(input_directory)
+    full_paths = [os.path.join(input_directory, entry) for entry in all_entries]
+    files = [path for path in full_paths if os.path.isfile(path)]
+    return sorted(files)
 
 
 async def del_old_msg_send_msg(msg, client, message):
@@ -336,6 +360,9 @@ def get_metadata(file):
 
 
 async def pyro_fsub(c, message, fsub):
+    if not fsub:
+        LOGGER.warning("UPDTE_CHNL is not set. Skipping force subscribe check.")
+        return True
     try:
         user = await c.get_chat_member(fsub, message.chat.id)
         if user.status == "kicked":
